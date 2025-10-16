@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+devopsfetch.py
+A CLI tool for system information retrieval and monitoring.
+
+Usage examples:
+  devopsfetch.py -p                   # list all active ports/services
+  devopsfetch.py -p 80                # detailed info about port 80
+  devopsfetch.py -d                   # list docker images and containers
+  devopsfetch.py -d container_name    # details for a container
+  devopsfetch.py -n                   # show nginx domains and ports
+  devopsfetch.py -n example.com       # show config for example.com
+  devopsfetch.py -u                   # list users & last login
+  devopsfetch.py -u alice             # details for user alice
+  devopsfetch.py --monitor            # run continuous monitoring (daemon mode)
+  devopsfetch.py -p --time "2025-10-01T00:00:00,2025-10-13T23:59:59"
+"""
+import argparse
+import subprocess
+import os
+import pwd
+import datetime
+import time
+import re
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from tabulate import tabulate
+
+# Config
+LOG_DIR = "/var/log/devopsfetch"
+LOG_FILE = os.path.join(LOG_DIR, "devopsfetch.log")
+POLL_INTERVAL = int(os.environ.get("DEVOPSFETCH_POLL_INTERVAL", "60"))  # seconds
+NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled"
+NGINX_CONF_DIRS = ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d", "/etc/nginx/sites-available"]
+DOCKER_SOCK = "unix://var/run/docker.sock"
+DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+# Ensure log directory exists when run with privileges
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Logger
+logger = logging.getLogger("devopsfetch")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+def iso_to_dt(s):
+    if not s:
+        return None
+    return datetime.datetime.fromisoformat(s)
+
+def parse_time_range(range_str):
+    if not range_str:
+        return None, None
+    parts = [p.strip() for p in range_str.split(",")]
+    if len(parts) != 2:
+        raise ValueError("time range must be 'START,END' in ISO format")
+    return iso_to_dt(parts[0]), iso_to_dt(parts[1])
+
+# -------------------------
+# Utility: run shell command
+# -------------------------
+def run_cmd(cmd):
+    try:
+        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, text=True)
+        return out.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+# -------------------------
+# Ports info
+# -------------------------
+def list_ports():
+    # use ss if present, fallback to netstat
+    ss_out = run_cmd("ss -tunlp")
+    if ss_out:
+        return parse_ss_output(ss_out)
+    net_out = run_cmd("netstat -tulpn")
+    return parse_netstat_output(net_out)
+
+def parse_ss_output(text):
+    lines = text.splitlines()
+    results = []
+    for ln in lines[1:]:
+        # sample fields: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+        cols = re.split(r'\s+', ln, maxsplit=6)
+        if len(cols) < 6:
+            continue
+        proto = cols[0]
+        local = cols[4]
+        pidproc = cols[6] if len(cols) > 6 else ""
+        # extract port
+        if ':' in local:
+            host, port = local.rsplit(':', 1)
+        else:
+            host, port = local, ''
+        proc = pidproc
+        results.append({"proto": proto, "local": local, "host": host, "port": port, "proc": proc})
+    return results
+
+def parse_netstat_output(text):
+    lines = text.splitlines()
+    results = []
+    for ln in lines[2:]:
+        cols = re.split(r'\s+', ln)
+        if len(cols) < 7: continue
+        proto = cols[0]
+        local = cols[3]
+        pidproc = cols[6]
+        if ':' in local:
+            host, port = local.rsplit(':',1)
+        else:
+            host, port = local, ''
+        results.append({"proto": proto, "local": local, "host": host, "port": port, "proc": pidproc})
+    return results
+
+def show_ports(table=True, port_filter=None):
+    rows = list_ports()
+    if port_filter:
+        rows = [r for r in rows if r["port"] == str(port_filter)]
+    if table:
+        tbl = [[r["proto"], r["host"], r["port"], r["proc"]] for r in rows]
+        print(tabulate(tbl, headers=["PROTO","HOST","PORT","PROCESS"], tablefmt="psql"))
+    else:
+        return rows
+
+# -------------------------
+# Docker info (uses docker CLI)
+# -------------------------
+def docker_list():
+    out = run_cmd("docker ps -a --format '{{json .}}' || true")
+    containers = []
+    if out:
+        for line in out.splitlines():
+            try:
+                containers.append(json.loads(line))
+            except:
+                continue
+    images_out = run_cmd("docker images --format '{{json .}}' || true")
+    images = []
+    if images_out:
+        for line in images_out.splitlines():
+            try:
+                images.append(json.loads(line))
+            except:
+                continue
+    return images, containers
+
+def docker_inspect(name):
+    out = run_cmd(f"docker inspect {name} --format '{{{{json .}}}}' || true")
+    try:
+        return json.loads(out) if out else {}
+    except:
+        return {}
+
+def show_docker(detail_name=None):
+    images, containers = docker_list()
+    if detail_name:
+        info = docker_inspect(detail_name)
+        if info:
+            print(json.dumps(info, indent=2))
+        else:
+            print(f"No inspect info found for {detail_name}")
+        return
+    # print images table and containers table
+    if images:
+        tbl = [[i.get("Repository",""), i.get("Tag",""), i.get("ID",""), i.get("Size","")] for i in images]
+        print("Docker Images:")
+        print(tabulate(tbl, headers=["REPOSITORY","TAG","IMAGE ID","SIZE"], tablefmt="psql"))
+    else:
+        print("No docker images found or docker not available.")
+    if containers:
+        tbl = [[c.get("ID",""), c.get("Image",""), c.get("Command",""), c.get("State",""), c.get("Status",""), c.get("Names","")] for c in containers]
+        print("\nDocker Containers:")
+        print(tabulate(tbl, headers=["ID","IMAGE","COMMAND","STATE","STATUS","NAMES"], tablefmt="psql"))
+
+# -------------------------
+# Nginx info
+# -------------------------
+def find_nginx_vhosts():
+    vhosts = []
+    for d in NGINX_CONF_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            full = os.path.join(d, f)
+            if os.path.isfile(full):
+                try:
+                    with open(full) as fh:
+                        txt = fh.read()
+                        # find server_name
+                        server_names = re.findall(r'server_name\s+([^;]+);', txt)
+                        listen_ports = re.findall(r'listen\s+([^;]+);', txt)
+                        # Clean
+                        server_names = [s.strip() for sn in server_names for s in sn.split()]
+                        listen_ports = [lp.strip() for lp in listen_ports]
+                        vhosts.append({"file": full, "server_names": server_names, "listen": listen_ports, "content": txt})
+                except Exception:
+                    continue
+    return vhosts
+
+def show_nginx(domain=None):
+    vhosts = find_nginx_vhosts()
+    if domain:
+        matches = [v for v in vhosts if domain in " ".join(v["server_names"])]
+        if not matches:
+            print(f"No nginx config for domain {domain}")
+            return
+        for m in matches:
+            print(f"--- Config: {m['file']} ---")
+            print(m["content"])
+    else:
+        tbl = []
+        for v in vhosts:
+            tbl.append([", ".join(v["server_names"]) or "-", ", ".join(v["listen"]) or "-", v["file"]])
+        print(tabulate(tbl, headers=["DOMAIN(S)","LISTEN","FILE"], tablefmt="psql"))
+
+# -------------------------
+# Users info
+# -------------------------
+def list_users():
+    # Use /etc/passwd to list users and `lastlog` to get last login
+    users = []
+    for p in pwd.getpwall():
+        if int(p.pw_uid) >= 1000 or p.pw_name in ("root",):
+            users.append(p.pw_name)
+    lastlog_out = run_cmd("lastlog -u " + ",".join(users) if users else "lastlog")
+    lastlog_map = {}
+    # parse lastlog output: Username         Port     From             Latest
+    lines = lastlog_out.splitlines()
+    for ln in lines[1:]:
+        parts = re.split(r'\s{2,}', ln.strip())
+        if not parts: continue
+        uname = parts[0]
+        lastlog_map[uname] = parts[1:] if len(parts) > 1 else []
+    rows = []
+    for u in users:
+        last = lastlog_map.get(u, ["Never logged in"])
+        rows.append({"user": u, "last": " | ".join(last)})
+    return rows
+
+def show_users(detail_user=None):
+    rows = list_users()
+    if detail_user:
+        for r in rows:
+            if r["user"] == detail_user:
+                print(tabulate([[r["user"], r["last"]]], headers=["USER","LAST LOGIN"], tablefmt="psql"))
+                return
+        print(f"No info for user {detail_user}")
+    else:
+        tbl = [[r["user"], r["last"]] for r in rows]
+        print(tabulate(tbl, headers=["USER","LAST LOGIN"], tablefmt="psql"))
+
+# -------------------------
+# Time filter helpers
+# -------------------------
+def in_time_range(dt, start, end):
+    if start and dt < start: return False
+    if end and dt > end: return False
+    return True
+
+# -------------------------
+# Monitoring loop
+# -------------------------
+def capture_snapshot():
+    ts = datetime.datetime.now().isoformat()
+    snapshot = {"ts": ts}
+    # ports
+    snapshot["ports"] = list_ports()
+    # docker
+    imgs, conts = docker_list()
+    snapshot["docker_images"] = imgs
+    snapshot["docker_containers"] = conts
+    # nginx
+    snapshot["nginx"] = [{"file": v["file"], "server_names": v["server_names"], "listen": v["listen"]} for v in find_nginx_vhosts()]
+    # users
+    snapshot["users"] = list_users()
+    return snapshot
+
+def monitor_loop(interval=POLL_INTERVAL):
+    logger.info("Starting devopsfetch monitor loop (interval %s seconds)", interval)
+    while True:
+        try:
+            snap = capture_snapshot()
+            logger.info("Snapshot: %s", json.dumps(snap, default=str))
+        except Exception as e:
+            logger.exception("Error during snapshot: %s", e)
+        time.sleep(interval)
+
+# -------------------------
+# CLI and main
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser(description="devopsfetch: system info & monitoring tool")
+    parser.add_argument("-p", "--port", nargs='?', const="ALL", help="List ports or provide port number for details")
+    parser.add_argument("-d", "--docker", nargs='?', const="ALL", help="List docker images/containers or provide container name/id for details")
+    parser.add_argument("-n", "--nginx", nargs='?', const="ALL", help="List nginx vhosts or provide a domain for config")
+    parser.add_argument("-u", "--users", nargs='?', const="ALL", help="List users and last login or provide username for details")
+    parser.add_argument("-t", "--time", help="Time range filter: START_ISO,END_ISO (e.g. 2025-10-01T00:00:00,2025-10-13T23:59:59)")
+    parser.add_argument("--monitor", action="store_true", help="Run in continuous monitoring mode (daemon)")
+    args = parser.parse_args()
+
+    start_dt, end_dt = parse_time_range(args.time) if args.time else (None, None)
+
+    # If monitor flag -> run monitor loop (writes logs)
+    if args.monitor:
+        monitor_loop()
+        return
+
+    # Dispatch
+    if args.port:
+        if args.port == "ALL":
+            show_ports()
+        else:
+            show_ports(port_filter=args.port)
+    if args.docker:
+        if args.docker == "ALL":
+            show_docker()
+        else:
+            show_docker(detail_name=args.docker)
+    if args.nginx:
+        if args.nginx == "ALL":
+            show_nginx()
+        else:
+            show_nginx(domain=args.nginx)
+    if args.users:
+        if args.users == "ALL":
+            show_users()
+        else:
+            show_users(detail_user=args.users)
+
+    # If no flags, show help
+    if not (args.port or args.docker or args.nginx or args.users or args.monitor):
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
